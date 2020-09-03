@@ -15,15 +15,16 @@ const char* LOCAL_FILE = "dnsrelay.txt";//默认配置文件名
 
 /*Dns结构的三个部分：head、问题、资源记录*/
 typedef struct DNSHEADER {
-	unsigned short ID;
-	unsigned short Flag;
-	unsigned short Qdcount;
-	unsigned short Ancount;
-	unsigned short Nscount;
-	unsigned short Arcount;
+	unsigned short ID;  //事务id
+	unsigned short Flag;//标志
+	unsigned short Qdcount;//问题计数
+	unsigned short Ancount;//回答计数
+	unsigned short Anscount;//权威服务器计数
+	unsigned short Arcount;//附加资源计数
 }DNSHEADER;			//dns头
 
 typedef struct DNSQUESTION {
+	//unsigned long Qname;
 	unsigned short Qtype;
 	unsigned short Qclass;
 }DNSQUESTION;		//dns问题
@@ -70,49 +71,61 @@ int findDomainLRU(char* dn, char* ip) {
 	return 0;
 }
 
-///*
-//* 构造响应报文
-//* 响应报文存放在buf里面
-//* ip是取得的ip，level为调试等级
-//*/
-//void Respond(char* buf, char* ip, int level) {
-//
-//}
+
 
 /*
-* 构造响应报文，在主机中查询到时使用，主要是通过更改查询报文实现的
-* buf为询问报文，ip为查询到的IP地址，level为调试等级，只有调试等级为2时，会输出不安全信息
+* header为dns头，buf为接收到的报文，ip为查询到的IP地址, level为调试等级
+* 用于填充dns头, header用于传出
+*/
+void fillinDnshead(DNSHEADER* header, char* buf, char* ip, int level) {
+	header = (DNSHEADER*)buf;
+
+	/*IP为0.0.0.0响应报文flag中的RCODE为0x3，即为name error，表示域名不存在*/
+	if (ip[0] == (char)0 && ip[1] == (char)0 && ip[2] == (char)0 && ip[3] == (char)0) {
+		/*调试等级为2时才会输出*/
+		if (level == 2)
+			printf("IPaddr is 0.0.0.0, the domainname is unsafe.\n");
+		header->Flag = htons(0x8183);//flag正常情况下为0x8180，rcode为最后一个字节，从0x0改为0x3
+	}
+	/*如果返回的ip不为“0.0.0.0”*/
+	else {
+		header->Flag = htons(0x8180);//将flag置为正常
+	}
+}
+
+/*
+* 构造了响应报文
+* buf为询问报文，ip为查询到的IP地址，level为调试等级
+* TODO: ttl需要传入修改 暂时还没做
+* ->htons()用于将字段字节序改为网络字节序，注意！！
 */
 void Respond(char* buf, char* ip, int level) {
 	DNSHEADER* header = (DNSHEADER*)buf;
 	DNSRESOURCE* resouce;
 
-	/*IP为0.0.0.0响应报文flag中的RCODE为0x3，表示域名不存在*/
-	if (ip[0] == (char)0 && ip[1] == (char)0 && ip[2] == (char)0 && ip[3] == (char)0) {
-		/*调试等级为2时才会输出*/
-		if (level == 2)
-			printf("IPaddr is 0.0.0.0, the domainname is unsafe.\n");
-		header->Flag = htons(0x8183);
-	}
-	/*正常情况的响应报文flag为0x8180*/
-	else {
-		header->Flag = htons(0x8180);
-	}
-	/*回答数为1*/
-	header->Ancount = htons(1);
+	/*填充报文头部*/
+	fillinDnshead(header, buf, ip, level);
 
-	char* dn = buf + 12;							//指向报文中的question头
-	char* name = dn + strlen(dn) + 1 + 4;			//指向报文中的answer头
-	unsigned short* nameTemp = (unsigned short*)name;
-	*nameTemp = htons(0xC00C);						//将answer的前两个字节写成0xC0
+	/*回答数为1*/
+	header->Ancount = htons(1);						//因为只返回了一个答案
+
+	char* query = buf + 12;							//指向报文中问题区域的头部，即查询名
+	char* answer = query + strlen(query) + 1 + 4;	//指向报文中的answer区域头部
+	unsigned short* nameTemp = (unsigned short*)answer;
+	*nameTemp = htons(0xC00C);						//将answer的前两个字节写成0xC0，随便填写暂时没用
+
 	/*对answer部分进行填写*/
-	resouce = (DNSRESOURCE*)(name + 2);
+	resouce = (DNSRESOURCE*)(answer + 2);			//指向答案部份的回答类型
 	resouce->Type = htons(1);
 	resouce->Class = htons(1);
-	resouce->TTL = htons(0x0FFF);
-	resouce->Length = htons(4);
+
+	resouce->TTL = htons(0x0FFF);					//TODO: ttl需要传入修改， 这里默认0xFFFF最大
+	resouce->Length = htons(4);						//填入4
+
 	/*填入IP答案*/
-	char* data = (char*)resouce + 10;
+	char* data = (char*)resouce + 10;				//resouce指向类型，data指向资源数据
+
+	/*这里写的有点丑就这样吧*/
 	*data = *ip;
 	*(data + 1) = *(ip + 1);
 	*(data + 2) = *(ip + 2);
@@ -142,7 +155,7 @@ void openFile(char* filename, int level) {
 int findDomain(char* dn, char* ip) {
 	Node* tmp = head;
 	char* ipPtr = NULL;
-	while (tmp->next != NULL) {
+	while (tmp != NULL) {
 		if (strcmp(dn, tmp->domainName) == 0) {
 			ipPtr = tmp->ip;
 			break;
@@ -163,11 +176,12 @@ int findDomain(char* dn, char* ip) {
 			}
 			ipPtr++;
 		}
+		*ip = sum; //最后一个数据存入
 		return 1;
 	}
 }
 
-/*将报文中的域名转化为可读的域名*/
+/*将报文中的域名转化为可读的域名，即将报文中表示字符个数的字节替换为“.”*/
 void ToDomainName(char* buf) {
 	char* p = buf;
 	while (*p != 0) {
@@ -177,6 +191,7 @@ void ToDomainName(char* buf) {
 	}
 }
 
+/*TODO:还没写*/
 void dns_init() {
 
 }
@@ -235,17 +250,19 @@ void dns_debug_0() {
 	while (1) {
 		memset(buf, 0, BUFFER_SIZE);//用0填充buf
 
-		/*从客户端接收信息，接收失败则进行下一步循环*/
+		/*从客户端接收信息，接收失败则进行下一步循环，buf接收了客户端的信息*/
 		x = recvfrom(socketClient, buf, BUFFER_SIZE, 0, (struct sockaddr*)&client, &len);
 		if (x < 0) {
 			continue;
 		}
 		/*将域名赋值到temp数组中*/
 		strcpy(temp, buf + sizeof(DNSHEADER) + 1);
-		ToDomainName(temp);//预处理
+		ToDomainName(temp);//预处理,处理为可读的ip地址
 
-		int isFind = 0;
+		int isFind = 0;//初始化返回值，懒得引入bool了
+
 		/*从LRU缓存池中查询*/
+		//TODO(Lxy)：函数还没有实现，现在是无脑返回false
 		isFind = findDomainLRU(temp, ip);
 
 		/*查询到结果则构造响应报文*/
@@ -326,7 +343,8 @@ int main(int argc, char** argv)
 	else {
 		printf("参数输入有误，请重新输入\n");
 	}
-	//printf("%d\n", domainIsExist("h0"));
-	printf("hello\n");
+	/*char* ip = (char*)malloc(4);
+	printf("%d\n", findDomain("h0", ip));
+	printf("hello\n");*/
 	return 0;
 }
